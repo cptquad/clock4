@@ -29,6 +29,7 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#include <ctype.h>
 #include "qspi_drv.h"
 #include "zonedetect.h"
 #include "chainloader.h"
@@ -138,6 +139,7 @@ int8_t iso_wday;
 uint8_t iso_week;
 uint32_t countdown_days;
 int32_t currentOffset=0;
+_Bool countdownCountingUp = 0;
 
 struct {
   uint8_t c;
@@ -364,7 +366,10 @@ void sendDate( _Bool now ){
   case MODE_STANDBY:
      return;
   case MODE_COUNTDOWN:
-    i = sprintf((char*)&uart2_tx_buffer[1], "t-%7ldd", countdown_days);
+  {
+    char sign = countdownCountingUp ? '+' : '-';
+    i = sprintf((char*)&uart2_tx_buffer[1], "t%c%7ldd", sign, (long)countdown_days);
+  }
     break;
   case MODE_DEBUG_BRIGHTNESS:
     i = sprintf((char*)&uart2_tx_buffer[1], "%04d %04d", (int)ADC1->DR, 4095-(int)dac_target);
@@ -501,19 +506,28 @@ void setNextTimestamp(time_t nextTime){
 
 void setNextCountdown(time_t nextTime){
 
-  int64_t remaining;
-  if (config.countdown_to < nextTime) {
-    remaining = 0;
-    SetPPS( &PPS_NoUpdate ); // don't show 999 at the next pulse
+  if (config.countdown_to == 0) {
+    countdownCountingUp = 0;
+    countdown_days = 0;
+    next7seg.b[0] = bCat0 | cLut[0]<<2;
+    next7seg.b[1] = bCat1 | cLut[0]<<2;
+    next7seg.b[2] = bCat2 | cLut[0]<<2;
+    next7seg.b[3] = bCat3 | cLut[0]<<2;
+    next7seg.b[4] = bCat4 | cLut[0]<<2;
+    next7seg.c = cLut[0];
+    return;
+  }
 
-  } else remaining = config.countdown_to - nextTime;
+  int64_t remaining = (int64_t)config.countdown_to - (int64_t)nextTime;
+  countdownCountingUp = (remaining < 0);
+  if (countdownCountingUp) remaining = -remaining;
 
-  uint64_t seconds = remaining % 60;
-  uint64_t minutes = remaining / 60;
-  uint64_t hours =   minutes / 60;
-  minutes %= 60;
-  countdown_days = hours / 24;
-  hours %= 24;
+  uint64_t seconds = (uint64_t)remaining % 60ULL;
+  uint64_t minutes = (uint64_t)remaining / 60ULL;
+  uint64_t hours =   minutes / 60ULL;
+  minutes %= 60ULL;
+  countdown_days = hours / 24ULL;
+  hours %= 24ULL;
 
   next7seg.b[0] = bCat0 | cLut[hours / 10]<<2;
   next7seg.b[1] = bCat1 | cLut[hours % 10]<<2;
@@ -895,6 +909,94 @@ float parseBrightness(char *v, _Bool invert){
   return -1;
 }
 
+static int64_t days_from_civil(int64_t y, unsigned m, unsigned d){
+  y -= m <= 2;
+  const int64_t era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int64_t)doe - 719468;
+}
+
+static time_t tm_to_utc(const struct tm *in){
+  int64_t days = days_from_civil((int64_t)in->tm_year + 1900, (unsigned)in->tm_mon + 1, (unsigned)in->tm_mday);
+  int64_t seconds = days * 86400
+                  + (int64_t)in->tm_hour * 3600
+                  + (int64_t)in->tm_min * 60
+                  + in->tm_sec;
+  return (time_t)seconds;
+}
+
+static int32_t countdownUtcOffsetAt(time_t t){
+  int32_t offset = 0;
+  for (uint16_t i=0; i<MAX_RULES; i++) {
+    if (rules[i].t == (uint32_t)-1) break;
+    if ((time_t)rules[i].t <= t) {
+      offset = rules[i].offset;
+    } else break;
+  }
+  return offset;
+}
+
+static time_t countdownLocalToUtc(const struct tm *local){
+  time_t naive = tm_to_utc(local);
+  time_t utc = naive;
+
+  for (uint8_t i=0; i<3; i++) {
+    time_t adjusted = naive - countdownUtcOffsetAt(utc);
+    if (adjusted == utc) break;
+    utc = adjusted;
+  }
+
+  return utc;
+}
+
+static _Bool parseCountdownTimestamp(const char *value, struct tm *out, _Bool *treatAsUtc){
+  if (!value || !value[0] || !out) return 0;
+
+  char buf[40];
+  strncpy(buf, value, sizeof(buf)-1);
+  buf[sizeof(buf)-1] = 0;
+
+  size_t len = strlen(buf);
+  while (len && isspace((unsigned char)buf[len-1])) buf[--len] = 0;
+  if (!len) return 0;
+
+  _Bool hasZ = 0;
+  if (len && (buf[len-1] == 'Z' || buf[len-1] == 'z')) {
+    hasZ = 1;
+    buf[--len] = 0;
+    while (len && isspace((unsigned char)buf[len-1])) buf[--len] = 0;
+  }
+
+  int hour = 0, minute = 0, second = 0;
+  char *timePart = strchr(buf, 'T');
+  if (timePart) {
+    *timePart = 0;
+    timePart++;
+    if (*timePart) {
+      int read = sscanf(timePart, "%d:%d:%d", &hour, &minute, &second);
+      if (read < 2) return 0;
+      if (read < 3) second = 0;
+    }
+  }
+
+  int year = 0, month = 0, day = 0;
+  if (sscanf(buf, "%d-%d-%d", &year, &month, &day) < 3) return 0;
+  if (year > 9999 || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+
+  out->tm_year = year - 1900;
+  out->tm_mon = month - 1;
+  out->tm_mday = day;
+  out->tm_hour = hour;
+  out->tm_min = minute;
+  out->tm_sec = second;
+  out->tm_isdst = 0;
+
+  if (treatAsUtc) *treatAsUtc = hasZ;
+  return 1;
+}
+
 #define set_mode_enabled(mode, value) \
   if ((config.modes_enabled[mode] = truthy(value))) requestMode=mode;
 
@@ -922,16 +1024,11 @@ void parseConfigString(char *key, char *value) {
 
   } else if (strcasecmp(key, "countdown_to") == 0) {
 
-    //  support fractional seconds??
     struct tm t = {0};
-    if( sscanf(value, "%d-%d-%dT%d:%d:%dZ", &t.tm_year, &t.tm_mon, &t.tm_mday, &t.tm_hour, &t.tm_min, &t.tm_sec) >=3) {
-
-      if (t.tm_year > 9999) return; // arbitrary cutoff, ~3e6 days
-      t.tm_year -= 1900;
-      t.tm_mon -= 1;
-
-      config.countdown_to = mktime(&t) -1;
-
+    _Bool treatAsUtc = 0;
+    if (parseCountdownTimestamp(value, &t, &treatAsUtc)) {
+      time_t target = treatAsUtc ? tm_to_utc(&t) : countdownLocalToUtc(&t);
+      config.countdown_to = target;
     }
   } else if (strcasecmp(key, "MODE_ISO8601_STD") == 0) {
     set_mode_enabled(MODE_ISO8601_STD, value);
@@ -1046,7 +1143,7 @@ void postConfigCleanup(void){
     setPrecision();
     latchSegments();
 
-    if (config.countdown_to < currentTime || decisec!=9 || centisec!=9 || millisec<7)
+    if (config.countdown_to <= currentTime || decisec!=9 || centisec!=9 || millisec<7)
       sendDate(1);
   } else if (displayMode == MODE_TEXT) {
     if (decisec!=9 || centisec!=9 || millisec<7)
@@ -1320,6 +1417,15 @@ void PPS_Init(void){
       } \
     }
 
+static inline void setNextDisplaySecond(void){
+  currentTime++;
+  if (displayMode == MODE_COUNTDOWN && countMode == COUNT_DOWN) {
+    setNextCountdown( currentTime );
+  } else {
+    setNextTimestamp( currentTime );
+  }
+}
+
 void SysTick_CountUp_P3(void)
 {
   timetick()
@@ -1337,8 +1443,7 @@ void SysTick_CountUp_P3(void)
     // Calculating the next display from the unix timestamp takes about 32uS with -O2, -O3 or -Os
     // takes about 70uS on -O0 so I think it's fine to do this within systick
     // If needed, we should move this to a lower priority software-triggered interrupt
-    currentTime++;
-    setNextTimestamp( currentTime );
+    setNextDisplaySecond();
     sendDate(0);
   }
 }
@@ -1352,8 +1457,7 @@ void SysTick_CountUp_P2(void) {
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
-    currentTime++;
-    setNextTimestamp( currentTime );
+    setNextDisplaySecond();
     sendDate(0);
   }
 }
@@ -1366,8 +1470,7 @@ void SysTick_CountUp_P1(void) {
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
-    currentTime++;
-    setNextTimestamp( currentTime );
+    setNextDisplaySecond();
     sendDate(0);
   }
 }
@@ -1379,8 +1482,7 @@ void SysTick_CountUp_P0(void) {
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
-    currentTime++;
-    setNextTimestamp( currentTime );
+    setNextDisplaySecond();
     sendDate(0);
   }
 }
@@ -1404,8 +1506,7 @@ void SysTick_CountUp_NoUpdate(void) {
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
-    currentTime++;
-    setNextTimestamp( currentTime );
+    setNextDisplaySecond();
     //sendDate(0);
   }
 }
@@ -1465,8 +1566,8 @@ void SysTick_CountDown_P1(void)
   }
 }
 
-// A no precision countdown is going to be really ambiguous, as it will hit zero a second before the target
-// Then again it will only be used in situations where the tolerance is worse than a second
+// A no precision countdown is going to be ambiguous, but it will only be used
+// in situations where the tolerance is worse than a second
 void SysTick_CountDown_P0(void)
 {
   timetick()
@@ -1624,59 +1725,62 @@ void checkDelayedLoadRules(){
   delayedLoadRules=0;
 }
 
+static void configureCountupPrecision(void){
+  if (currentTime - last_pps_time < config.tolerance_1ms){
+    buffer_c[0].high= 0b11001110 | cSegDP;
+    SetSysTick( &SysTick_CountUp_P3 );
+  } else if (currentTime - last_pps_time < config.tolerance_10ms){
+    buffer_c[3].low = 0b01000000;
+    buffer_c[0].high= 0b11001110 | cSegDP;
+    SetSysTick( &SysTick_CountUp_P2 );
+  } else if (currentTime - rtc_last_calibration < config.tolerance_100ms){
+    buffer_c[3].low = 0b01000000;
+    buffer_c[2].low = 0b01000000;
+    buffer_c[0].high= 0b11001110 | cSegDP;
+    SetSysTick( &SysTick_CountUp_P1 );
+  } else {
+    buffer_c[3].low = 0b01000000;
+    buffer_c[2].low = 0b01000000;
+    buffer_c[1].low = 0b01000000;
+    buffer_c[0].high= 0b11001110;
+    SetSysTick( &SysTick_CountUp_P0 );
+  }
+}
+
+static void configureCountdownPrecision(void){
+  if (currentTime - last_pps_time < config.tolerance_1ms){
+    buffer_c[0].high= 0b11001110 | cSegDP;
+    SetSysTick( &SysTick_CountDown_P3 );
+  } else if (currentTime - last_pps_time < config.tolerance_10ms){
+    buffer_c[3].low = 0b01000000;
+    buffer_c[0].high= 0b11001110 | cSegDP;
+    SetSysTick( &SysTick_CountDown_P2 );
+  } else if (currentTime - rtc_last_calibration < config.tolerance_100ms){
+    buffer_c[3].low = 0b01000000;
+    buffer_c[2].low = 0b01000000;
+    buffer_c[0].high= 0b11001110 | cSegDP;
+    SetSysTick( &SysTick_CountDown_P1 );
+  } else {
+    buffer_c[3].low = 0b01000000;
+    buffer_c[2].low = 0b01000000;
+    buffer_c[1].low = 0b01000000;
+    buffer_c[0].high= 0b11001110;
+    SetSysTick( &SysTick_CountDown_P0 );
+  }
+}
+
 void setPrecision(void){
   if (countMode == COUNT_NORMAL) {
 
-    // situations not covered:
-    // - short poweroff - not had pps, but RTC calibrated only seconds ago
-    // - last pps more than 100000 seconds ago (27 hours)
-    if (currentTime - last_pps_time < config.tolerance_1ms){
-      buffer_c[0].high= 0b11001110 | cSegDP;
-      SetSysTick( &SysTick_CountUp_P3 );
-    } else if (currentTime - last_pps_time < config.tolerance_10ms){
-      buffer_c[3].low = 0b01000000;
-      buffer_c[0].high= 0b11001110 | cSegDP;
-      SetSysTick( &SysTick_CountUp_P2 );
-    } else if (currentTime - rtc_last_calibration < config.tolerance_100ms){
-      buffer_c[3].low = 0b01000000;
-      buffer_c[2].low = 0b01000000;
-      buffer_c[0].high= 0b11001110 | cSegDP;
-      SetSysTick( &SysTick_CountUp_P1 );
-    } else {
-      buffer_c[3].low = 0b01000000;
-      buffer_c[2].low = 0b01000000;
-      buffer_c[1].low = 0b01000000;
-      buffer_c[0].high= 0b11001110;
-      SetSysTick( &SysTick_CountUp_P0 );
-    }
+    SetPPS( &PPS );
+    configureCountupPrecision();
 
   } else if (displayMode == MODE_COUNTDOWN) {
 
-    if (config.countdown_to >= currentTime) {
-      SetPPS( &PPS_Countdown );
-
-      if (currentTime - last_pps_time < config.tolerance_1ms){
-        buffer_c[0].high= 0b11001110 | cSegDP;
-        SetSysTick( &SysTick_CountDown_P3 );
-      } else if (currentTime - last_pps_time < config.tolerance_10ms){
-        buffer_c[3].low = 0b01000000;
-        buffer_c[0].high= 0b11001110 | cSegDP;
-        SetSysTick( &SysTick_CountDown_P2 );
-      } else if (currentTime - rtc_last_calibration < config.tolerance_100ms){
-        buffer_c[3].low = 0b01000000;
-        buffer_c[2].low = 0b01000000;
-        buffer_c[0].high= 0b11001110 | cSegDP;
-        SetSysTick( &SysTick_CountDown_P1 );
-      } else {
-        buffer_c[3].low = 0b01000000;
-        buffer_c[2].low = 0b01000000;
-        buffer_c[1].low = 0b01000000;
-        buffer_c[0].high= 0b11001110;
-        SetSysTick( &SysTick_CountDown_P0 );
-      }
-
-    } else {
+    if (config.countdown_to == 0) {
       countMode = COUNT_HIDDEN;
+      countdownCountingUp = 0;
+      countdown_days = 0;
       SetSysTick( &SysTick_CountUp_NoUpdate );
       SetPPS( &PPS_NoUpdate );
       buffer_c[0].high= 0b11001110 | cSegDP;
@@ -1691,6 +1795,14 @@ void setPrecision(void){
       next7seg.b[3] = bCat3 | cLut[0]<<2;
       next7seg.b[4] = bCat4 | cLut[0]<<2;
       next7seg.c = cLut[0];
+    } else if (config.countdown_to >= currentTime) {
+      countMode = COUNT_DOWN;
+      SetPPS( &PPS_Countdown );
+      configureCountdownPrecision();
+    } else {
+      countMode = COUNT_DOWN;
+      SetPPS( &PPS );
+      configureCountupPrecision();
     }
 
   }
@@ -1740,11 +1852,12 @@ void nextMode(_Bool reverse){
     TIM2->CCR2 = 300;
   } else if (displayMode == MODE_COUNTDOWN) {
 
-    if (config.countdown_to >= currentTime) {
+    if (config.countdown_to > 0) {
       countMode = COUNT_DOWN;
       setNextCountdown(currentTime);
     } else {
       countMode = COUNT_HIDDEN;
+      countdownCountingUp = 0;
       countdown_days = 0;
     }
     setPrecision();
