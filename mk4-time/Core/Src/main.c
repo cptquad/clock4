@@ -1417,6 +1417,15 @@ void PPS_Init(void){
       } \
     }
 
+static inline void setNextDisplaySecond(void){
+  currentTime++;
+  if (displayMode == MODE_COUNTDOWN && countMode == COUNT_DOWN) {
+    setNextCountdown( currentTime );
+  } else {
+    setNextTimestamp( currentTime );
+  }
+}
+
 void SysTick_CountUp_P3(void)
 {
   timetick()
@@ -1434,8 +1443,7 @@ void SysTick_CountUp_P3(void)
     // Calculating the next display from the unix timestamp takes about 32uS with -O2, -O3 or -Os
     // takes about 70uS on -O0 so I think it's fine to do this within systick
     // If needed, we should move this to a lower priority software-triggered interrupt
-    currentTime++;
-    setNextTimestamp( currentTime );
+    setNextDisplaySecond();
     sendDate(0);
   }
 }
@@ -1449,8 +1457,7 @@ void SysTick_CountUp_P2(void) {
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
-    currentTime++;
-    setNextTimestamp( currentTime );
+    setNextDisplaySecond();
     sendDate(0);
   }
 }
@@ -1463,8 +1470,7 @@ void SysTick_CountUp_P1(void) {
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
-    currentTime++;
-    setNextTimestamp( currentTime );
+    setNextDisplaySecond();
     sendDate(0);
   }
 }
@@ -1476,8 +1482,7 @@ void SysTick_CountUp_P0(void) {
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
-    currentTime++;
-    setNextTimestamp( currentTime );
+    setNextDisplaySecond();
     sendDate(0);
   }
 }
@@ -1501,8 +1506,7 @@ void SysTick_CountUp_NoUpdate(void) {
   HAL_IncTick();
 
   if (decisec==9 && centisec==0 && millisec==0){
-    currentTime++;
-    setNextTimestamp( currentTime );
+    setNextDisplaySecond();
     //sendDate(0);
   }
 }
