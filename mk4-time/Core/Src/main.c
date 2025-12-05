@@ -954,8 +954,12 @@ static time_t countdownLocalToUtc(const struct tm *local){
   return utc;
 }
 
-static _Bool parseCountdownTimestamp(const char *value, struct tm *out, _Bool *treatAsUtc){
+static _Bool parseCountdownTimestamp(const char *value, struct tm *out, _Bool *treatAsUtc, _Bool *hasExplicitOffset, int32_t *explicitOffsetSeconds){
   if (!value || !value[0] || !out) return 0;
+
+  if (treatAsUtc) *treatAsUtc = 0;
+  if (hasExplicitOffset) *hasExplicitOffset = 0;
+  if (explicitOffsetSeconds) *explicitOffsetSeconds = 0;
 
   char buf[40];
   strncpy(buf, value, sizeof(buf)-1);
@@ -977,10 +981,59 @@ static _Bool parseCountdownTimestamp(const char *value, struct tm *out, _Bool *t
   if (timePart) {
     *timePart = 0;
     timePart++;
+
+    _Bool parsedOffset = 0;
+    int32_t tzOffsetSeconds = 0;
+    if (*timePart) {
+      char *tzIndicator = NULL;
+      for (char *p = timePart; *p; p++) {
+        if ((*p == '+' || *p == '-') && p > timePart) {
+          tzIndicator = p;
+          break;
+        }
+      }
+
+      if (tzIndicator && !hasZ) {
+        char signChar = *tzIndicator;
+        char *offsetPart = tzIndicator + 1;
+        *tzIndicator = 0;
+
+        if (!offsetPart[0] || !isdigit((unsigned char)offsetPart[0]) || !isdigit((unsigned char)offsetPart[1])) return 0;
+
+        int rawHours = (offsetPart[0]-'0')*10 + (offsetPart[1]-'0');
+        int rawMinutes = 0;
+        const char *cursor = offsetPart + 2;
+
+        if (*cursor == ':') {
+          cursor++;
+          if (!isdigit((unsigned char)cursor[0]) || !isdigit((unsigned char)cursor[1])) return 0;
+          rawMinutes = (cursor[0]-'0')*10 + (cursor[1]-'0');
+          cursor += 2;
+        } else if (*cursor) {
+          if (!isdigit((unsigned char)cursor[0]) || !isdigit((unsigned char)cursor[1])) return 0;
+          rawMinutes = (cursor[0]-'0')*10 + (cursor[1]-'0');
+          cursor += 2;
+        }
+
+        if (*cursor) return 0;
+        if (rawHours > 14 || rawMinutes > 59) return 0;
+        if (rawHours == 14 && rawMinutes != 0) return 0;
+
+        tzOffsetSeconds = rawHours * 3600 + rawMinutes * 60;
+        if (signChar == '-') tzOffsetSeconds = -tzOffsetSeconds;
+        parsedOffset = 1;
+      }
+    }
+
     if (*timePart) {
       int read = sscanf(timePart, "%d:%d:%d", &hour, &minute, &second);
       if (read < 2) return 0;
       if (read < 3) second = 0;
+    }
+
+    if (!hasZ && parsedOffset) {
+      if (hasExplicitOffset) *hasExplicitOffset = 1;
+      if (explicitOffsetSeconds) *explicitOffsetSeconds = tzOffsetSeconds;
     }
   }
 
@@ -1029,8 +1082,17 @@ void parseConfigString(char *key, char *value) {
 
     struct tm t = {0};
     _Bool treatAsUtc = 0;
-    if (parseCountdownTimestamp(value, &t, &treatAsUtc)) {
-      time_t target = treatAsUtc ? tm_to_utc(&t) : countdownLocalToUtc(&t);
+    _Bool hasExplicitOffset = 0;
+    int32_t explicitOffsetSeconds = 0;
+    if (parseCountdownTimestamp(value, &t, &treatAsUtc, &hasExplicitOffset, &explicitOffsetSeconds)) {
+      time_t target;
+      if (treatAsUtc) {
+        target = tm_to_utc(&t);
+      } else if (hasExplicitOffset) {
+        target = tm_to_utc(&t) - explicitOffsetSeconds;
+      } else {
+        target = countdownLocalToUtc(&t);
+      }
       config.countdown_to = target;
     }
   } else if (strcasecmp(key, "MODE_ISO8601_STD") == 0) {
