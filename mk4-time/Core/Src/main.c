@@ -367,8 +367,11 @@ void sendDate( _Bool now ){
      return;
   case MODE_COUNTDOWN:
   {
-    char sign = countdownCountingUp ? '+' : '-';
-    i = sprintf((char*)&uart2_tx_buffer[1], "t%c%7ldd", sign, (long)countdown_days);
+    if (countdownCountingUp) {
+      i = sprintf((char*)&uart2_tx_buffer[1], "t%8ldd", (long)countdown_days);
+    } else {
+      i = sprintf((char*)&uart2_tx_buffer[1], "t-%7ldd", (long)countdown_days);
+    }
   }
     break;
   case MODE_DEBUG_BRIGHTNESS:
