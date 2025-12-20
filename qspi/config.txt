@@ -51,6 +51,9 @@ MODE_STANDBY=disabled
 MODE_COUNTDOWN = off
 COUNTDOWN_TO = 2023-05-06T23:00:00Z
 
+# Predator-style countdown (hex digits for HH:MM:SS + hex days on date display)
+MODE_PREDATOR_COUNTDOWN = off
+
 
 # generic text display, can be used for testing
 MODE_TEXT=off

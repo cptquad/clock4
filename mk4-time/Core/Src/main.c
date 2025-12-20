@@ -108,6 +108,22 @@ void nextMode(_Bool);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 const uint8_t cLut[]= { cSegDecode0, cSegDecode1, cSegDecode2, cSegDecode3, cSegDecode4, cSegDecode5, cSegDecode6, cSegDecode7, cSegDecode8, cSegDecode9 };
+
+// Standard 7-seg encodings for hex digits (A-F). Bit layout matches cSegDecode0..9.
+#define cSegDecodeA 0b01110111
+#define cSegDecodeb 0b01111100
+#define cSegDecodeC 0b00111001
+#define cSegDecoded 0b01011110
+#define cSegDecodeE 0b01111001
+#define cSegDecodeF 0b01110001
+static const uint8_t cLutHex[] = {
+  cSegDecode0, cSegDecode1, cSegDecode2, cSegDecode3,
+  cSegDecode4, cSegDecode5, cSegDecode6, cSegDecode7,
+  cSegDecode8, cSegDecode9, cSegDecodeA, cSegDecodeb,
+  cSegDecodeC, cSegDecoded, cSegDecodeE, cSegDecodeF
+};
+
+#define is_countdown_mode(m) ((m) == MODE_COUNTDOWN || (m) == MODE_PREDATOR_COUNTDOWN)
 const uint16_t bLut[]={ bSegDecode0, bSegDecode1, bSegDecode2, bSegDecode3, bSegDecode4, bSegDecode5, bSegDecode6, bSegDecode7, bSegDecode8, bSegDecode9 };
 
 const char* wday_str[]={"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
@@ -374,6 +390,16 @@ void sendDate( _Bool now ){
     }
   }
     break;
+  case MODE_PREDATOR_COUNTDOWN:
+  {
+    // Predator-style: show days in hex, zero-padded, with a distinct prefix.
+    if (countdownCountingUp) {
+      i = sprintf((char*)&uart2_tx_buffer[1], "p+%07lXd", (unsigned long)countdown_days);
+    } else {
+      i = sprintf((char*)&uart2_tx_buffer[1], "p-%07lXd", (unsigned long)countdown_days);
+    }
+  }
+    break;
   case MODE_DEBUG_BRIGHTNESS:
     i = sprintf((char*)&uart2_tx_buffer[1], "%04d %04d", (int)ADC1->DR, 4095-(int)dac_target);
     break;
@@ -532,12 +558,22 @@ void setNextCountdown(time_t nextTime){
   countdown_days = hours / 24ULL;
   hours %= 24ULL;
 
-  next7seg.b[0] = bCat0 | cLut[hours / 10]<<2;
-  next7seg.b[1] = bCat1 | cLut[hours % 10]<<2;
-  next7seg.b[2] = bCat2 | cLut[minutes / 10]<<2;
-  next7seg.b[3] = bCat3 | cLut[minutes % 10]<<2;
-  next7seg.b[4] = bCat4 | cLut[seconds / 10]<<2;
-  next7seg.c = cLut[seconds % 10];
+  if (displayMode == MODE_PREDATOR_COUNTDOWN) {
+    // Show HH:MM:SS fields as two hex digits each (e.g. 23 -> 17).
+    next7seg.b[0] = bCat0 | (cLutHex[(hours >> 4) & 0xF] << 2);
+    next7seg.b[1] = bCat1 | (cLutHex[hours & 0xF] << 2);
+    next7seg.b[2] = bCat2 | (cLutHex[(minutes >> 4) & 0xF] << 2);
+    next7seg.b[3] = bCat3 | (cLutHex[minutes & 0xF] << 2);
+    next7seg.b[4] = bCat4 | (cLutHex[(seconds >> 4) & 0xF] << 2);
+    next7seg.c = cLutHex[seconds & 0xF];
+  } else {
+    next7seg.b[0] = bCat0 | cLut[hours / 10]<<2;
+    next7seg.b[1] = bCat1 | cLut[hours % 10]<<2;
+    next7seg.b[2] = bCat2 | cLut[minutes / 10]<<2;
+    next7seg.b[3] = bCat3 | cLut[minutes % 10]<<2;
+    next7seg.b[4] = bCat4 | cLut[seconds / 10]<<2;
+    next7seg.c = cLut[seconds % 10];
+  }
 }
 
 // Store UTC on RTC
@@ -1117,6 +1153,8 @@ void parseConfigString(char *key, char *value) {
     set_mode_enabled(MODE_STANDBY, value);
   } else if (strcasecmp(key, "MODE_COUNTDOWN") == 0) {
     set_mode_enabled(MODE_COUNTDOWN, value);
+  } else if (strcasecmp(key, "MODE_PREDATOR_COUNTDOWN") == 0) {
+    set_mode_enabled(MODE_PREDATOR_COUNTDOWN, value);
   } else if (strcasecmp(key, "MODE_SATVIEW") == 0) {
     set_mode_enabled(MODE_SATVIEW, value);
   } else if (strcasecmp(key, "MODE_DEBUG_BRIGHTNESS") == 0) {
@@ -1203,7 +1241,7 @@ void postConfigCleanup(void){
   if (config.tolerance_10ms == 0)  config.tolerance_10ms  = 0xFFFFFFFF;
   if (config.tolerance_100ms == 0) config.tolerance_100ms = 0xFFFFFFFF;
 
-  if (displayMode == MODE_COUNTDOWN) {
+  if (is_countdown_mode(displayMode)) {
     setNextCountdown(currentTime);
     setPrecision();
     latchSegments();
@@ -1484,7 +1522,7 @@ void PPS_Init(void){
 
 static inline void setNextDisplaySecond(void){
   currentTime++;
-  if (displayMode == MODE_COUNTDOWN && countMode == COUNT_DOWN) {
+  if (is_countdown_mode(displayMode) && countMode == COUNT_DOWN) {
     setNextCountdown( currentTime );
   } else {
     setNextTimestamp( currentTime );
@@ -1840,7 +1878,7 @@ void setPrecision(void){
     SetPPS( &PPS );
     configureCountupPrecision();
 
-  } else if (displayMode == MODE_COUNTDOWN) {
+  } else if (is_countdown_mode(displayMode)) {
 
     if (config.countdown_to == 0) {
       countMode = COUNT_HIDDEN;
@@ -1904,7 +1942,7 @@ void nextMode(_Bool reverse){
     buffer_c[2].high &= ~cSegDP;
     buffer_c[3].high &= ~cSegDP;
   }
-  if ( displayMode == MODE_ISO_WEEK || justExited(MODE_COUNTDOWN)) {
+  if ( displayMode == MODE_ISO_WEEK || justExited(MODE_COUNTDOWN) || justExited(MODE_PREDATOR_COUNTDOWN)) {
     // If we exit countdown mode at .9 seconds
     // it will show the wrong time for .1 seconds
     setNextTimestamp(currentTime);
@@ -1917,7 +1955,7 @@ void nextMode(_Bool reverse){
     colonAnimationStop()
     TIM2->CCR1 = 0; // specific to show_offset
     TIM2->CCR2 = 300;
-  } else if (displayMode == MODE_COUNTDOWN) {
+  } else if (is_countdown_mode(displayMode)) {
 
     if (config.countdown_to > 0) {
       countMode = COUNT_DOWN;
